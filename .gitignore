@@ -1,0 +1,36 @@
+# === FRONTEND (React) ===
+# Ignora as dependências do Node
+**/node_modules/
+**/.pnp
+**/.pnp.js
+
+# Ignora as pastas de build/produção do React
+**/dist/
+**/build/
+
+# Ignora logs de erro do npm/yarn
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+
+# === BACKEND (Python) ===
+# Ignora ambientes virtuais do Python
+**/.venv/
+**/venv/
+**/env/
+**/ENV/
+
+# Ignora arquivos compilados do Python
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+
+# Ignora pastas de IDEs (como VS Code ou PyCharm)
+.vscode/
+.idea/
+
+# === GERAL ===
+# Ignora arquivos de variáveis de ambiente (onde ficam suas senhas e chaves)
+**/.env
+**/.env.local

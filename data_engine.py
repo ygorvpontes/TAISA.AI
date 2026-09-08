@@ -7,7 +7,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FUP_DIR = os.path.join(BASE_DIR, 'FUP')
 OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
 
+# Garante que a pasta de saída existe
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# --- FUNÇÕES AUXILIARES ---
 def clean_string_key(series: pd.Series) -> pd.Series:
     """Padroniza chaves alfanuméricas removendo caracteres especiais e espaços."""
     return series.astype(str).str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.upper().str.strip()
@@ -34,13 +37,13 @@ def build_piloto_geral() -> pd.DataFrame:
     dfs = []
     if file_as:
         dfs.append(pd.read_excel(file_as))
-        print(f"  ✅ Piloto AS carregada.")
+        print("  ✅ Piloto AS carregada.")
     else:
         print("  ⚠️ Piloto_AS não encontrada em FUP.")
 
     if file_mdt:
         dfs.append(pd.read_excel(file_mdt))
-        print(f"  ✅ Piloto MDT carregada.")
+        print("  ✅ Piloto MDT carregada.")
     else:
         print("  ⚠️ Piloto_MDT não encontrada em FUP.")
 
@@ -67,34 +70,28 @@ def load_auxiliary_keys(keyword: str, possible_col_names: list) -> set:
     return set()
 
 
-# --- PROCESSAMENTO DO NOVO ARQUIVO DE STO (POWER BI) ---
+# --- MODO 1: PROCESSAMENTO DO NOVO ARQUIVO DE STO (POWER BI) ---
 def process_sto_powerbi(invoices_alvo: list) -> pd.DataFrame:
-    print(f"\n⚙️ Processando base STO Power BI para as invoices: {invoices_alvo}...")
+    print(f"\n⚙️ Processando base nova (STO Power BI) para as invoices: {invoices_alvo}...")
     
     file_sto = get_latest_file_safely("STO_PowerBI")
-    if not file_sto:
-        file_sto = get_latest_file_safely("Data Explorer") # Tenta o nome alternativo
-    
-    if not file_sto:
-        raise FileNotFoundError("❌ Arquivo de extração STO do Power BI não encontrado na pasta FUP.")
+    if not file_sto: 
+        file_sto = get_latest_file_safely("Data Explorer")
+    if not file_sto: 
+        raise FileNotFoundError("❌ Arquivo STO Power BI não encontrado.")
 
     df = pd.read_excel(file_sto, sheet_name="Export")
 
-    # F8 = GTS Invoice Number | F2 = Invoice Number
     df['F8_GTS_Invoice'] = clean_number_col(df['GTS Invoice Number'])
     df['F2_Invoice'] = clean_number_col(df['Invoice Number'])
 
     invoices_alvo_str = [str(inv).strip() for inv in invoices_alvo]
-
-    # Busca tanto na fatura GTS (F8) quanto na fatura fiscal física (F2)
     filtro = df['F8_GTS_Invoice'].isin(invoices_alvo_str) | df['F2_Invoice'].isin(invoices_alvo_str)
     df_filtrado = df[filtro].copy()
 
-    if df_filtrado.empty:
-        print("❌ Nenhuma linha localizada para as invoices informadas.")
+    if df_filtrado.empty: 
         return pd.DataFrame()
 
-    # Higienização de chaves para cruzamento
     df_filtrado['CFN_Tratada'] = clean_string_key(df_filtrado['CFN'])
     df_filtrado['Material_Tratado'] = clean_string_key(df_filtrado['Material'])
     df_filtrado['Delivery_Clean'] = clean_number_col(df_filtrado['Delivery Number'])
@@ -102,16 +99,38 @@ def process_sto_powerbi(invoices_alvo: list) -> pd.DataFrame:
     return df_filtrado
 
 
+# --- MODO 2: PROCESSAMENTO LEGADO DA BILL 2 ---
+def process_bill2_legacy(invoices_alvo: list) -> pd.DataFrame:
+    print(f"\n⚙️ Processando base antiga (BILL 2) para as invoices: {invoices_alvo}...")
+    file_bill2 = get_latest_file_safely("Bill2")
+    if not file_bill2:
+        raise FileNotFoundError("❌ Arquivo legado Bill2 não encontrado na pasta FUP.")
+        
+    df = pd.read_excel(file_bill2)
+    
+    # ⚠️ AQUI ENTRA A LÓGICA ANTIGA DO PANDAS PARA A BILL 2
+    # Exemplo do que precisa ser mapeado no final do processo da Bill2:
+    # df['F8_GTS_Invoice'] = ...
+    # df['F2_Invoice'] = ...
+    # df['CFN_Tratada'] = ...
+    # df['Material_Tratado'] = ...
+    # df['Delivery_Clean'] = ...
+    # df['Delivery Quantity'] = ...
+    # df['Delivery Value'] = ...
+    
+    return df
+
+
 # --- MOTOR DE COMPLIANCE (CHECK POINTS E FORMATAÇÃO) ---
-def aplicar_regras_green_light(df_sto, df_piloto, pricing_issues, refurbished, raw_materials, previous_il, masterdata):
+def aplicar_regras_green_light(df_base, df_piloto, pricing_issues, refurbished, raw_materials, previous_il, masterdata):
     print("\n⚙️ Executando motor de regras e gerando Check Points...")
 
     if not df_piloto.empty:
-        df_final = pd.merge(df_sto, df_piloto, left_on='CFN_Tratada', right_on='Código Tratado', how='left')
+        df_final = pd.merge(df_base, df_piloto, left_on='CFN_Tratada', right_on='Código Tratado', how='left')
     else:
-        df_final = df_sto.copy()
+        df_final = df_base.copy()
 
-    # Criação das colunas de flag (Yes/No) para manter compatibilidade com o Excel antigo
+    # Criação das colunas de flag (Yes/No)
     df_final['Pricing Issue'] = 'No'
     df_final['Require LI'] = 'No'
     df_final['Is RawMaterial'] = 'No'
@@ -159,13 +178,13 @@ def aplicar_regras_green_light(df_sto, df_piloto, pricing_issues, refurbished, r
         row['Check Point'] = "; ".join(alertas) if alertas else "Green Light Autorizado"
         return row
 
-    # Aplica a função linha a linha
+    # Aplica as regras linha a linha
     df_final = df_final.apply(avaliar_linha, axis=1)
     
     # --- FORMATAÇÃO IDÊNTICA AO EXCEL DO POWER QUERY ---
     
-    # Calcular o Unit Price (Power BI só manda o Total e a Qtd)
-    df_final['Unit Price'] = (df_final['Delivery Value'] / df_final['Delivery Quantity']).round(2)
+    # Calcular o Unit Price (Trata divisões por zero ou nulos)
+    df_final['Unit Price'] = (df_final['Delivery Value'] / df_final['Delivery Quantity'].replace(0, 1)).round(2)
     
     # Mapeamento exato das 39 colunas
     de_para_colunas = {
@@ -173,15 +192,15 @@ def aplicar_regras_green_light(df_sto, df_piloto, pricing_issues, refurbished, r
         'Supply Plant': 'Vendor',
         'Receive Plant': 'Planta Destino',
         'PO Number': 'STO',
-        'GTS Invoice Number': 'Invoice Number F8',
-        'Invoice Date': 'Invoice Date F8',       # Fallback caso não tenha data exclusiva do GTS
-        'Invoice Number': 'Invoice Number F2',
-        'Invoice Date': 'Invoice Date F2',
-        'Delivery Number': 'Delivery Number',
+        'F8_GTS_Invoice': 'Invoice Number F8',
+        'Invoice Date': 'Invoice Date F8',
+        'F2_Invoice': 'Invoice Number F2',
+        'Invoice Date': 'Invoice Date F2', # Mapeia mesma data se não houver colunas separadas
+        'Delivery_Clean': 'Delivery Number',
         'Material': 'UPN',
         'CFN': 'CFN Number',
         'Batch / Serial / Lot': 'Batch_F2',
-        'Manufacturing Date': 'Manufacturing Date', # Tenta pegar se existir no PBI
+        'Manufacturing Date': 'Manufacturing Date',
         'Shelf-Life': 'Piloto_Geral.Shelf-Life',
         'Descrição do Código': 'Piloto_Geral.Descrição do Código',
         'Material Description': 'Material Number1',
@@ -191,7 +210,7 @@ def aplicar_regras_green_light(df_sto, df_piloto, pricing_issues, refurbished, r
         'CFN_Tratada': 'CFN_Tratada_GreenLight',
         'Delivery Value': 'Extended Price',
         'Pricing Issue': 'Pricing Issue',
-        'Currency': 'Extended Amount Currency', # Se não existir, preenchemos com BRL depois
+        'Currency': 'Extended Amount Currency',
         'NCM': 'MasterData_Tratada.NCM',
         'Require LI': 'Require LI',
         'Is RawMaterial': 'Is RawMaterial',
@@ -210,7 +229,7 @@ def aplicar_regras_green_light(df_sto, df_piloto, pricing_issues, refurbished, r
         'Planner': 'MasterData_Tratada.Planner'
     }
 
-    # Criar DataFrame final com as colunas na ordem exata
+    # Criar DataFrame final apenas com as colunas mapeadas e na ordem exata
     df_export = pd.DataFrame()
     for col_orig, col_dest in de_para_colunas.items():
         if col_orig in df_final.columns:
@@ -218,7 +237,7 @@ def aplicar_regras_green_light(df_sto, df_piloto, pricing_issues, refurbished, r
         else:
             df_export[col_dest] = None # Cria a coluna vazia se a base fonte não possuir
             
-    # Garantir moeda e preencher nulls de campos calculados
+    # Garantir preenchimento da moeda
     if 'Extended Amount Currency' in df_export.columns:
         df_export['Extended Amount Currency'] = df_export['Extended Amount Currency'].fillna('USD')
 
@@ -227,7 +246,6 @@ def aplicar_regras_green_light(df_sto, df_piloto, pricing_issues, refurbished, r
 
 # --- EXPORTAÇÃO ---
 def exportar_excel_green_light(df_final: pd.DataFrame, invoice_num: str):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
     caminho_arquivo = os.path.join(OUTPUT_DIR, f"{invoice_num}_GL.xlsx")
     
     # Aba Validacao_Preco_F8
@@ -237,7 +255,7 @@ def exportar_excel_green_light(df_final: pd.DataFrame, invoice_num: str):
         Sum_Amount=('Extended Price', 'sum')
     ).reset_index()
 
-    # Renomear para ficar igual a aba de Preco
+    # Renomear para ficar igual a aba antiga
     resumo_f8.rename(columns={
         'Count_Currency': 'Count of Extended Amount Currency',
         'Sum_Qty': 'Sum of Total Qty F8',
@@ -251,8 +269,12 @@ def exportar_excel_green_light(df_final: pd.DataFrame, invoice_num: str):
     print(f"\n📄 ARQUIVO OFICIAL GERADO: {caminho_arquivo}")
 
 
-# --- ORQUESTRADOR ---
-def run_green_light_pipeline(lista_de_invoices: list):
+# --- ORQUESTRADOR COM CHAVE SELETORA ---
+def run_green_light_pipeline(lista_de_invoices: list, fonte: str = "STO"):
+    """
+    Roda o motor de Green Light. 
+    fonte="STO" (novo Power BI) ou fonte="BILL2" (método antigo SAP).
+    """
     piloto = build_piloto_geral()
     pricing_issues = load_auxiliary_keys("Pricing", ['CFN', 'Material'])
     refurbished = load_auxiliary_keys("Refurbished", ['CFN', 'Material'])
@@ -260,23 +282,33 @@ def run_green_light_pipeline(lista_de_invoices: list):
     previous_il = load_auxiliary_keys("Previous_IL", ['CFN', 'Material'])
     masterdata = load_auxiliary_keys("MasterData", ['CFN', 'Material'])
 
-    df_sto = process_sto_powerbi(lista_de_invoices)
-    if df_sto.empty: return pd.DataFrame()
+    # O "Disjuntor" que escolhe qual base ler
+    if fonte == "STO":
+        df_base = process_sto_powerbi(lista_de_invoices)
+    elif fonte == "BILL2":
+        df_base = process_bill2_legacy(lista_de_invoices)
+    else:
+        raise ValueError("Fonte inválida. Use 'STO' ou 'BILL2'.")
 
-    df_resultado = aplicar_regras_green_light(df_sto, piloto, pricing_issues, refurbished, raw_materials, previous_il, masterdata)
+    if df_base.empty: 
+        print(f"❌ Nenhuma invoice encontrada na fonte {fonte}.")
+        return pd.DataFrame()
+
+    df_resultado = aplicar_regras_green_light(df_base, piloto, pricing_issues, refurbished, raw_materials, previous_il, masterdata)
     
-    # Exporta para excel o resultado
-    exportar_excel_green_light(df_resultado, lista_de_invoices[0])
+    exportar_excel_green_light(df_resultado, f"{lista_de_invoices[0]}_{fonte}")
     
-    print("✅ Pipeline executado com sucesso!")
+    print(f"✅ Pipeline executado com sucesso usando a base {fonte}!")
     return df_resultado
 
 if __name__ == "__main__":
+    # Teste de execução
     invoices_teste = ["1090748838"]
-    resultado = run_green_light_pipeline(invoices_teste)
-
+    
+    # Escolha a fonte: "STO" ou "BILL2"
+    resultado = run_green_light_pipeline(invoices_teste, fonte="STO")
+    
     if not resultado.empty:
-        colunas_exibicao = ['F8_GTS_Invoice', 'CFN', 'Delivery Quantity', 'Check Point']
-        colunas_presentes = [c for c in colunas_exibicao if c in resultado.columns]
+        colunas_exibicao = ['Invoice Number F8', 'CFN Number', 'Qty', 'Check Point']
         print("\n🏆 PREVIEW DO CHAT DA TAISA:")
-        print(resultado[colunas_presentes].head(10))
+        print(resultado[colunas_exibicao].head(10))
