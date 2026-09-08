@@ -1,182 +1,197 @@
-import pandas as pd
-import glob
 import os
+import glob
+import pandas as pd
 
-# --- 1. CONFIGURAÇÕES GERAIS (BLINDADAS PARA CODESPACES/LINUX) ---
-# Pega o caminho absoluto da pasta onde o data_engine.py está salvo
+# --- CONFIGURAÇÕES DE DIRETÓRIO ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Junta com a pasta FUP
-FUP_DIR = os.path.join(BASE_DIR, 'FUP') 
+FUP_DIR = os.path.join(BASE_DIR, 'FUP')
+OUTPUT_DIR = os.path.join(BASE_DIR, 'output')
 
-def get_latest_file(keyword, extension=".xlsx"):
-    """Varre a pasta FUP e retorna o caminho do arquivo mais recente contendo a keyword."""
-    # Monta o padrão (Ex: /workspaces/projeto/FUP/*Piloto_AS*.xlsx)
+
+def clean_string_key(series: pd.Series) -> pd.Series:
+    """Padroniza chaves alfanuméricas removendo caracteres especiais e espaços."""
+    return series.astype(str).str.replace(r'[^a-zA-Z0-9]', '', regex=True).str.upper().str.strip()
+
+def clean_number_col(series: pd.Series) -> pd.Series:
+    """Remove decimais flutuantes do Excel e espaços em colunas numéricas."""
+    return series.astype(str).str.split('.').str[0].str.strip()
+
+def get_latest_file_safely(keyword: str, extension: str = ".xlsx"):
+    """Busca o arquivo mais recente pela keyword. Retorna None se não encontrar."""
     search_pattern = os.path.join(FUP_DIR, f"*{keyword}*{extension}")
-    
-    print(f"🔎 Buscando na pasta: {search_pattern}") 
-    
     files = glob.glob(search_pattern)
     if not files:
-        raise FileNotFoundError(f"❌ Nenhum arquivo encontrado para a keyword: '{keyword}' em {FUP_DIR}")
-    
-    # Retorna o arquivo com a maior data de modificação
-    latest_file = max(files, key=os.path.getmtime)
-    print(f"✅ Arquivo encontrado: {os.path.basename(latest_file)}")
-    return latest_file
+        return None
+    return max(files, key=os.path.getmtime)
 
-# --- 2. FÁBRICA DE PILOTOS ---
-def build_piloto_geral():
-    """Equivale à união da Piloto_AS e Piloto_MDT."""
-    print("Construindo Piloto Geral...")
-    df_as = pd.read_excel(get_latest_file("Piloto_AS"))
-    df_mdt = pd.read_excel(get_latest_file("Piloto_MDT"))
-    return pd.concat([df_as, df_mdt], ignore_index=True)
 
-# --- 3. PROCESSAMENTO DA F8 (INVOICE FINANCEIRA) ---
-def process_bill2_f8(invoices_alvo: list):
-    """Trata a F8 e filtra SOMENTE as invoices solicitadas pelo usuário/TAISA."""
-    print(f"⚙️ Processando F8 e filtrando as Invoices: {invoices_alvo}...")
+# --- CARREGADORES DE BASES ---
+def build_piloto_geral() -> pd.DataFrame:
+    print("\n📋 Carregando bases regulatórias (Piloto AS + Piloto MDT)...")
+    file_as = get_latest_file_safely("Piloto_AS")
+    file_mdt = get_latest_file_safely("Piloto_MDT")
+
+    dfs = []
+    if file_as:
+        dfs.append(pd.read_excel(file_as))
+        print(f"  ✅ Piloto AS carregada.")
+    else:
+        print("  ⚠️ Piloto_AS não encontrada em FUP.")
+
+    if file_mdt:
+        dfs.append(pd.read_excel(file_mdt))
+        print(f"  ✅ Piloto MDT carregada.")
+    else:
+        print("  ⚠️ Piloto_MDT não encontrada em FUP.")
+
+    if not dfs:
+        print("  ⚠️ Nenhuma base Piloto encontrada. O Check Point usará dados limitados.")
+        return pd.DataFrame()
+
+    df_piloto = pd.concat(dfs, ignore_index=True)
+    if 'Código Tratado' in df_piloto.columns:
+        df_piloto['Código Tratado'] = clean_string_key(df_piloto['Código Tratado'])
+    return df_piloto
+
+def load_auxiliary_keys(keyword: str, possible_col_names: list) -> set:
+    filepath = get_latest_file_safely(keyword)
+    if not filepath:
+        print(f"  ⚠️ Auxiliar '{keyword}' não encontrada. Checagem ignorada.")
+        return set()
     
-    file_bil2 = get_latest_file("ZKP_MP06_Q5001_Bil2")
-    df = pd.read_excel(file_bil2, sheet_name="1. ZKP_MP06_Q5001_Bil2")
+    df = pd.read_excel(filepath)
+    for col in possible_col_names:
+        if col in df.columns:
+            print(f"  ✅ Auxiliar '{keyword}' carregada.")
+            return set(clean_string_key(df[col]).dropna().unique())
+    return set()
+
+
+# --- PROCESSAMENTO DO NOVO ARQUIVO DE STO (POWER BI) ---
+def process_sto_powerbi(invoices_alvo: list) -> pd.DataFrame:
+    print(f"\n⚙️ Processando base STO Power BI para as invoices: {invoices_alvo}...")
     
-    # --- BLINDAGEM DE TIPOS DE DADOS ---
-    df['Invoice Number'] = df['Invoice Number'].astype(str).str.strip()
-    df['Invoice Type'] = df['Invoice Type'].astype(str).str.strip().str.upper()
+    file_sto = get_latest_file_safely("STO_PowerBI")
+    if not file_sto:
+        file_sto = get_latest_file_safely("Data Explorer") # Tenta o nome alternativo
+    
+    if not file_sto:
+        raise FileNotFoundError("❌ Arquivo de extração STO do Power BI não encontrado na pasta FUP.")
+
+    df = pd.read_excel(file_sto, sheet_name="Export")
+
+    # F8 = GTS Invoice Number | F2 = Invoice Number
+    df['F8_GTS_Invoice'] = clean_number_col(df['GTS Invoice Number'])
+    df['F2_Invoice'] = clean_number_col(df['Invoice Number'])
+
     invoices_alvo_str = [str(inv).strip() for inv in invoices_alvo]
-    
-    # Filtros F8 e Invoice Alvo
-    df_f8 = df[df['Invoice Type'] == 'F8'].copy()
-    df_f8_filtrado = df_f8[df_f8['Invoice Number'].isin(invoices_alvo_str)]
-    
-    if df_f8_filtrado.empty:
-        print("❌ Aviso: A invoice não foi encontrada no filtro F8.")
-        return df_f8_filtrado, pd.DataFrame()
-        
-    df_f8 = df_f8_filtrado
-    
-    # Restante da lógica (Quebra de lote)
-    df_f8[['Material_Number', 'Batch_1']] = df_f8['Batch'].astype(str).str.split('/', n=1, expand=True)
-    
-    # BLINDAGEM DA CHAVE PRIMÁRIA F8
-    df_f8['Delivery Number'] = df_f8['Delivery Number'].astype(str).str.split('.').str[0].str.strip()
-    df_f8['Material_Number'] = df_f8['Material_Number'].astype(str).str.strip()
-    df_f8['PK_Delivery_UPN_F8'] = df_f8['Delivery Number'] + df_f8['Material_Number']
-    
-    # Agrupamento (Preservando a PK_Delivery_UPN_F8)
-    agrupado = df_f8.groupby([
-        'Invoice Number', 'Invoice Date', 'Delivery Number', 
-        'Material_Number', 'Extended Amount Currency', 'PK_Delivery_UPN_F8'
-    ]).agg(
-        Total_Qty_F8=('Extended Qty at the Item Level', 'sum'),
-        Total_Invoice_Amount_F8=('Extended Amount at the Item Level', 'sum')
-    ).reset_index()
-    
-    return df_f8, agrupado
 
-# --- 4. PROCESSAMENTO DA F2 (INVOICE FÍSICA) ---
-def process_bill2_f2(df_f8_agrupada):
-    """Filtra as Invoices IV e cruza com os valores financeiros da F8."""
-    print("⚙️ Processando F2 (Invoices IV) e cruzando com F8...")
-    
-    file_bil2 = get_latest_file("ZKP_MP06_Q5001_Bil2")
-    df = pd.read_excel(file_bil2, sheet_name="1. ZKP_MP06_Q5001_Bil2")
-    
-    # Blindagem de tipos F2
-    df['Invoice Type'] = df['Invoice Type'].astype(str).str.strip().str.upper()
-    df['Delivery Number'] = df['Delivery Number'].astype(str).str.split('.').str[0].str.strip()
-    
-    # Filtro: Apenas IV e Quantidade diferente de zero
-    df_f2 = df[(df['Invoice Type'] == 'IV') & (df['Extended Qty at the Item Level'] != 0)].copy()
-    
-    if df_f2.empty:
-        print("❌ Aviso: Nenhuma Invoice IV encontrada na base.")
-        return df_f2
-    
-    # Quebra de Batch 
-    df_f2[['Material_Number', 'Batch_F2']] = df_f2['Batch'].astype(str).str.split('/', n=1, expand=True)
-    
-    # BLINDAGEM DA CHAVE PRIMÁRIA F2
-    df_f2['Material_Number'] = df_f2['Material_Number'].astype(str).str.strip()
-    df_f2['PK_Delivery_UPN_F2'] = df_f2['Delivery Number'] + df_f2['Material_Number']
-    
-    # O PRIMEIRO GRANDE MERGE: F2 recebendo os dados da F8
-    df_merged = pd.merge(
-        df_f2, 
-        df_f8_agrupada, 
-        left_on='PK_Delivery_UPN_F2', 
-        right_on='PK_Delivery_UPN_F8', 
-        how='left'
-    )
-    
-    return df_merged
+    # Busca tanto na fatura GTS (F8) quanto na fatura fiscal física (F2)
+    filtro = df['F8_GTS_Invoice'].isin(invoices_alvo_str) | df['F2_Invoice'].isin(invoices_alvo_str)
+    df_filtrado = df[filtro].copy()
 
-# --- 5. O MOTOR DE COMPLIANCE (CHECK POINTS) ---
-def aplicar_regras_green_light(df_f2_f8, df_piloto):
-    """Cruza a base financeira/física com as regras regulatórias (Piloto)."""
-    print("⚙️ Aplicando regras de compliance e gerando Check Points...")
-    
-    # Limpeza do CFN para cruzar com a Piloto (Arranca caracteres especiais)
-    df_f2_f8['CFN_Tratada_GreenLight'] = df_f2_f8['CFN Number'].astype(str).str.replace(r'[^a-zA-Z0-9]', '', regex=True)
-    
-    # O SEGUNDO GRANDE MERGE: Cruzando com a Piloto Geral (ANVISA)
-    df_final = pd.merge(
-        df_f2_f8,
-        df_piloto,
-        left_on='CFN_Tratada_GreenLight',
-        right_on='Código Tratado',
-        how='left'
-    )
-    
-    # --- CONSTRUÇÃO DOS CHECK POINTS DINÂMICOS ---
-    def gerar_alertas(row):
+    if df_filtrado.empty:
+        print("❌ Nenhuma linha localizada para as invoices informadas.")
+        return pd.DataFrame()
+
+    # Higienização de chaves para cruzamento
+    df_filtrado['CFN_Tratada'] = clean_string_key(df_filtrado['CFN'])
+    df_filtrado['Material_Tratado'] = clean_string_key(df_filtrado['Material'])
+    df_filtrado['Delivery_Clean'] = clean_number_col(df_filtrado['Delivery Number'])
+
+    return df_filtrado
+
+
+# --- MOTOR DE COMPLIANCE (CHECK POINTS) ---
+def aplicar_regras_green_light(df_sto, df_piloto, pricing_issues, refurbished, raw_materials, previous_il, masterdata):
+    print("\n⚙️ Executando motor de regras e gerando Check Points...")
+
+    if not df_piloto.empty:
+        df_final = pd.merge(df_sto, df_piloto, left_on='CFN_Tratada', right_on='Código Tratado', how='left')
+    else:
+        df_final = df_sto.copy()
+
+    def avaliar_linha(row):
         alertas = []
+
+        # 1. ANVISA (Piloto)
+        if not df_piloto.empty:
+            if pd.isna(row.get('Código Tratado')):
+                alertas.append("Check Código na Tabela Piloto")
+            else:
+                status = str(row.get('Status de Comercialização', ''))
+                if not status.lower().startswith('lib'):
+                    alertas.append("Check status de comercialização")
+
+                detentor = str(row.get('Detentor do Registro', ''))
+                if 'suture' not in detentor.lower() and not detentor.lower().startswith('medtronic'):
+                    alertas.append("Check Detentor do Registro")
+
+        # 2 a 6. Outras verificações
+        cfn = str(row.get('CFN_Tratada', ''))
+        mat = str(row.get('Material_Tratado', ''))
         
-        # Regra 1: Existe na Piloto?
-        if pd.isna(row.get('Código Tratado')):
-            alertas.append("Check Código tratado na Tabela Piloto")
-        else:
-            # Regra 2: Status de Comercialização é 'Liberado'?
-            status = str(row.get('Status de Comercialização', ''))
-            if not status.lower().startswith('lib'):
-                alertas.append("Check status de comercialização")
-            
-            # Regra 3: Detentor do Registro (Auto Suture / Medtronic)
-            detentor = str(row.get('Detentor do Registro', ''))
-            if 'suture' not in detentor.lower() and not detentor.lower().startswith('medtronic'):
-                alertas.append("Check Detentor do Registro")
-                
+        if pricing_issues and (cfn in pricing_issues or mat in pricing_issues): alertas.append("Check Pricing Issue")
+        if refurbished and (cfn in refurbished or mat in refurbished): alertas.append("Check Refurbished")
+        if raw_materials and (cfn in raw_materials or mat in raw_materials): alertas.append("Check Raw Material")
+        if previous_il and (cfn in previous_il or mat in previous_il): alertas.append("Check Previous IL")
+        if masterdata and (cfn not in masterdata and mat not in masterdata): alertas.append("Check MasterData")
+
         return "; ".join(alertas) if alertas else "Green Light Autorizado"
 
-    # Aplica a função linha a linha
-    df_final['Check Point'] = df_final.apply(gerar_alertas, axis=1)
-    
+    df_final['Check Point'] = df_final.apply(avaliar_linha, axis=1)
     return df_final
 
 
-# --- ORQUESTRADOR PRINCIPAL ---
+# --- EXPORTAÇÃO ---
+def exportar_excel_green_light(df_final: pd.DataFrame, invoice_num: str):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    caminho_arquivo = os.path.join(OUTPUT_DIR, f"{invoice_num}_GL.xlsx")
+
+    # Resumo F8 (Validacao_Preco_F8)
+    if 'Extended Amount Currency' not in df_final.columns:
+        df_final['Extended Amount Currency'] = 'USD' # fallback
+        
+    resumo_f8 = df_final.groupby(['F8_GTS_Invoice', 'Delivery_Clean']).agg(
+        Count_Currency=('Extended Amount Currency', 'count'),
+        Sum_Qty=('Delivery Quantity', 'sum'),
+        Sum_Amount=('Delivery Value', 'sum')
+    ).reset_index()
+
+    with pd.ExcelWriter(caminho_arquivo, engine='openpyxl') as writer:
+        df_final.to_excel(writer, sheet_name='Green_Light', index=False)
+        resumo_f8.to_excel(writer, sheet_name='Validacao_Preco_F8', index=False)
+
+    print(f"\n📄 ARQUIVO OFICIAL GERADO: {caminho_arquivo}")
+
+
+# --- ORQUESTRADOR ---
 def run_green_light_pipeline(lista_de_invoices: list):
-    """Executa o fluxo completo do pipeline."""
-    # 1. Constrói a base regulatória
     piloto = build_piloto_geral()
+    pricing_issues = load_auxiliary_keys("Pricing", ['CFN', 'Material'])
+    refurbished = load_auxiliary_keys("Refurbished", ['CFN', 'Material'])
+    raw_materials = load_auxiliary_keys("Raw_Material", ['CFN', 'Material'])
+    previous_il = load_auxiliary_keys("Previous_IL", ['CFN', 'Material'])
+    masterdata = load_auxiliary_keys("MasterData", ['CFN', 'Material'])
+
+    df_sto = process_sto_powerbi(lista_de_invoices)
+    if df_sto.empty: return pd.DataFrame()
+
+    df_resultado = aplicar_regras_green_light(df_sto, piloto, pricing_issues, refurbished, raw_materials, previous_il, masterdata)
     
-    # 2. Puxa e agrupa a F8 baseada no input da TAISA
-    f8_raw, f8_agrupada = process_bill2_f8(lista_de_invoices)
-    
-    # 3. Puxa a F2 e cruza com a F8
-    f2_f8_cruzada = process_bill2_f2(f8_agrupada)
-    
-    # 4. Passa no motor de Compliance!
-    base_final = aplicar_regras_green_light(f2_f8_cruzada, piloto)
+    # Exporta para excel o resultado da primeira invoice da lista
+    exportar_excel_green_light(df_resultado, lista_de_invoices[0])
     
     print("✅ Pipeline executado com sucesso!")
-    return base_final
+    return df_resultado
 
 if __name__ == "__main__":
-    # Teste isolado no terminal
-    invoices_para_testar = ["1090748838"] 
-    df_final = run_green_light_pipeline(invoices_para_testar)
-    
-    if not df_final.empty:
-        print("\n🏆 RESULTADO DO GREEN LIGHT:")
-        print(df_final[['Invoice Number_x', 'CFN Number', 'Check Point']].head(10))
+    # Teste com a fatura que sabemos que está no arquivo Data Explorer!
+    invoices_teste = ["1090748838"]
+    resultado = run_green_light_pipeline(invoices_teste)
+
+    if not resultado.empty:
+        colunas_exibicao = ['F8_GTS_Invoice', 'CFN', 'Delivery Quantity', 'Check Point']
+        colunas_presentes = [c for c in colunas_exibicao if c in resultado.columns]
+        print("\n🏆 PREVIEW DO CHAT DA TAISA:")
+        print(resultado[colunas_presentes].head(10))
